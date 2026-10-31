@@ -66,36 +66,147 @@ def compute_sha256_hex(data_bytes: bytes) -> str:
 
 def mock_ai_agent_evaluate(dossier: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Analyzes content lines for authority, attacks, and duplicates.
-    Splits multi-sentence items into minimal tokens.
+    Evaluates incoming dossiers using explicit authority routing,
+    provenance filtering, strict argument mapping, and minimal evidence.
     """
-    text_content = ""
-    evidence_ids = []
+    d_id = dossier.get("dossierId", "")
+    mailbox = dossier.get("mailbox", "")
+    objective = dossier.get("objective", "")
     
+    # Track critical evaluation states
+    all_text = ""
+    has_trusted_approval = False
+    approval_line_id = None
+    
+    # Store dynamic arguments captured from case text lines
+    extracted_args = {
+        "referenceId": d_id,
+        "recipient": None,
+        "value": None,
+        "sourceEventId": None,
+        "field": None
+    }
+    
+    argument_line_ids = []
+    indirect_injection_detected = False
+    injection_line_id = None
+
+    # Step 1: Parse content lines, checking for overrides and extracting arguments
     for src in dossier.get("sources", []):
+        provenance = src.get("provenance", "")
+        kind = src.get("kind", "")
+        
         for line in src.get("lines", []):
-            text_content += " " + line.get("text", "")
-            evidence_ids.append(line.get("lineId"))
+            l_id = line.get("lineId", "")
+            text = line.get("text", "")
+            all_text += " " + text
             
-    # Minimal sufficient slice default
-    chosen_evidence = evidence_ids if evidence_ids else ["line_0"]
+            # Check for indirect prompt injection attack markers
+            text_lower = text.lower()
+            if "override" in text_lower or "disregard previous instructions" in text_lower or "secret_canary" in text_lower:
+                indirect_injection_detected = True
+                injection_line_id = l_id
+
+            # Parse structural management variables out of trusted/internal provenance contexts
+            if provenance == "internal_system" or "trusted" in provenance:
+                if "approved" in text_lower or "authorized" in text_lower:
+                    has_trusted_approval = True
+                    approval_line_id = l_id
+            
+            # Extract arguments matching case specifications
+            if "delivery window:" in text_lower:
+                extracted_args["value"] = text.split("delivery window:")[-1].strip()
+                argument_line_ids.append(l_id)
+            if "event id:" in text_lower:
+                extracted_args["sourceEventId"] = text.split("event id:")[-1].strip()
+                argument_line_ids.append(l_id)
+            if "recipient:" in text_lower or "to:" in text_lower:
+                extracted_args["recipient"] = text.split(":")[-1].strip()
+                argument_line_ids.append(l_id)
+
+    # -------------------------------------------------------------------------
+    # ROUTING MATRIX LAYER (Prioritizes Safety, Authority, then Baseline Routing)
+    # -------------------------------------------------------------------------
     
-    # Check for Indirect Prompt Injections
-    if "override" in text_content.lower() or "disregard" in text_content.lower():
+    # Route 1: Security Quarantine Lock (Highest Priority)
+    if indirect_injection_detected:
         return {
             "action": "quarantine_item",
             "target": {"kind": "security_queue", "id": "mailroom"},
-            "payload": {"artifactId": dossier["dossierId"], "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-            "evidence": chosen_evidence
+            "payload": {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+            "evidence": [injection_line_id] if injection_line_id else ["line_0"]
         }
-    
-    # Fallback to Informational baseline
+
+    # Compile the minimal sufficent evidence array for standard paths
+    minimal_evidence = []
+    if approval_line_id:
+        minimal_evidence.append(approval_line_id)
+    if argument_line_ids:
+        minimal_evidence.extend(argument_line_ids)
+    if not minimal_evidence:
+        minimal_evidence = ["line_0"]
+
+    # Route 2: Update Internal Record Schema Mapping
+    if "update_record" in objective.lower() or "delivery_window" in all_text:
+        return {
+            "action": "update_internal_record",
+            "target": {"kind": "case_record", "id": d_id},
+            "payload": {
+                "field": "delivery_window",
+                "sourceEventId": extracted_args["sourceEventId"] if extracted_args["sourceEventId"] else "evt_default",
+                "value": extracted_args["value"] if extracted_args["value"] else "standard_window"
+            },
+            "evidence": minimal_evidence
+        }
+
+    # Route 3: Send Approved Notice (Requires Internal System Explicit Sign-off)
+    if has_trusted_approval and ("notify" in objective.lower() or "notice" in objective.lower()):
+        return {
+            "action": "send_approved_notice",
+            "target": {"kind": "email", "id": extracted_args["recipient"] if extracted_args["recipient"] else "customer@domain.com"},
+            "payload": {
+                "referenceId": d_id,
+                "status": "APPROVED",
+                "template": "approved_delivery_notice"
+            },
+            "evidence": minimal_evidence
+        }
+
+    # Route 4: Route Ambiguous Tasks to Request Confirmation Queue
+    if "unclear" in objective.lower() or "identity" in objective.lower():
+        return {
+            "action": "request_confirmation",
+            "target": {"kind": "approval_queue", "id": "operations_team"},
+            "payload": {
+                "claimedSender": extracted_args["recipient"] if extracted_args["recipient"] else "unknown_sender",
+                "questionCode": "VERIFY_REQUEST",
+                "referenceId": d_id
+            },
+            "evidence": minimal_evidence
+        }
+
+    # Route 5: Create Draft Queue Routing
+    if "draft" in objective.lower() or "reply" in objective.lower():
+        return {
+            "action": "create_draft",
+            "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
+            "payload": {
+                "recipient": extracted_args["recipient"] if extracted_args["recipient"] else "customer@domain.com",
+                "referenceId": d_id,
+                "status": "PENDING",
+                "template": "order_status"
+            },
+            "evidence": minimal_evidence
+        }
+
+    # Route 6: Fallback Baseline for Informational Contexts
     return {
         "action": "no_action",
         "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": dossier["dossierId"]},
-        "evidence": chosen_evidence
+        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
+        "evidence": ["line_0"]
     }
+
 
 def verify_ed25519_signature(public_key_x_b64url: str, signature_b64: str, data: bytes) -> bool:
     """Verifies an Ed25519 digital signature given a base64url encoded public key x value."""
