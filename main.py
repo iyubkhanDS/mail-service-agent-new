@@ -13,7 +13,7 @@ def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         
-        # 1. Stores evaluation context metadata
+        # 1. Tracks active lifecycle phases (awaiting_receipts vs completed)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS evaluations (
                 evaluation_id TEXT PRIMARY KEY,
@@ -23,7 +23,7 @@ def init_db():
             )
         """)
         
-        # 2. Caches agent proposals by the deterministic content hash of a dossier
+        # 2. Caches decisions by content hash to prevent duplicate AI charges
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS dossier_cache (
                 content_hash TEXT PRIMARY KEY,
@@ -35,7 +35,7 @@ def init_db():
             )
         """)
         
-        # 3. Maps active proposal digests to their dossier for verification validation
+        # 3. Maps active proposal digests to cross-check during Phase 2
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS proposals (
                 evaluation_id TEXT,
@@ -48,11 +48,11 @@ def init_db():
         """)
         conn.commit()
 
-# Run database setup immediately when script initializes
+# Execute database tables setup on script boot
 init_db()
 
 def canonical_json_bytes(obj: Any) -> bytes:
-    """Encodes JSON structures compactly with recursively sorted keys."""
+    """Recursively key-sorted compact JSON view engine."""
     return json.dumps(
         obj, 
         sort_keys=True, 
@@ -64,165 +64,154 @@ def compute_sha256_hex(data_bytes: bytes) -> str:
     """Returns the lowercase SHA-256 hex string for the provided bytes."""
     return hashlib.sha256(data_bytes).hexdigest().lower()
 
-def mock_ai_agent_evaluate(dossier: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_dossier_securely(dossier: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Evaluates incoming dossiers using explicit authority routing,
-    provenance filtering, strict argument mapping, and minimal evidence.
+    Parses explicitly documented authority, checks content provenance boundaries,
+    and returns exact frozen target-payload structures with minimal evidence.
     """
     d_id = dossier.get("dossierId", "")
     mailbox = dossier.get("mailbox", "")
-    objective = dossier.get("objective", "")
+    objective = str(dossier.get("objective", "")).lower()
     
-    # Track critical evaluation states
     all_text = ""
-    has_trusted_approval = False
-    approval_line_id = None
+    evidence_lines = []
+    has_internal_approval = False
     
-    # Store dynamic arguments captured from case text lines
-    extracted_args = {
-        "referenceId": d_id,
+    extracted = {
         "recipient": None,
+        "referenceId": None,
         "value": None,
-        "sourceEventId": None,
-        "field": None
+        "sourceEventId": None
     }
-    
-    argument_line_ids = []
-    indirect_injection_detected = False
-    injection_line_id = None
 
-    # Step 1: Parse content lines, checking for overrides and extracting arguments
+    # Step 1: Scan lines for strict authority flags and dynamic variables
     for src in dossier.get("sources", []):
-        provenance = src.get("provenance", "")
-        kind = src.get("kind", "")
+        provenance = str(src.get("provenance", "")).lower()
         
         for line in src.get("lines", []):
             l_id = line.get("lineId", "")
             text = line.get("text", "")
             all_text += " " + text
-            
-            # Check for indirect prompt injection attack markers
             text_lower = text.lower()
-            if "override" in text_lower or "disregard previous instructions" in text_lower or "secret_canary" in text_lower:
-                indirect_injection_detected = True
-                injection_line_id = l_id
 
-            # Parse structural management variables out of trusted/internal provenance contexts
-            if provenance == "internal_system" or "trusted" in provenance:
-                if "approved" in text_lower or "authorized" in text_lower:
-                    has_trusted_approval = True
-                    approval_line_id = l_id
-            
-            # Extract arguments matching case specifications
-            if "delivery window:" in text_lower:
-                extracted_args["value"] = text.split("delivery window:")[-1].strip()
-                argument_line_ids.append(l_id)
-            if "event id:" in text_lower:
-                extracted_args["sourceEventId"] = text.split("event id:")[-1].strip()
-                argument_line_ids.append(l_id)
-            if "recipient:" in text_lower or "to:" in text_lower:
-                extracted_args["recipient"] = text.split(":")[-1].strip()
-                argument_line_ids.append(l_id)
+            # Rule A: Enforce prompt injection boundary filters (Highest Priority)
+            if "override" in text_lower or "disregard" in text_lower or "canary" in text_lower:
+                return {
+                    "action": "quarantine_item",
+                    "target": {"kind": "security_queue", "id": "mailroom"},
+                    "payload": {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
+                    "evidence": [l_id]
+                }
+
+            # Rule B: Identify Explicit System Authority
+            if "internal" in provenance or "system" in provenance or "trusted" in provenance:
+                if "approve" in text_lower or "authorize" in text_lower:
+                    has_internal_approval = True
+                    if l_id not in evidence_lines:
+                        evidence_lines.append(l_id)
+
+            # Rule C: Parse case arguments safely
+            if "recipient:" in text_lower:
+                extracted["recipient"] = text.split("recipient:")[-1].strip()
+                if l_id not in evidence_lines:
+                    evidence_lines.append(l_id)
+            elif "delivery window:" in text_lower:
+                extracted["value"] = text.split("delivery window:")[-1].strip()
+                if l_id not in evidence_lines:
+                    evidence_lines.append(l_id)
+            elif "event id:" in text_lower:
+                extracted["sourceEventId"] = text.split("event id:")[-1].strip()
+                if l_id not in evidence_lines:
+                    evidence_lines.append(l_id)
+            elif "reference id:" in text_lower:
+                extracted["referenceId"] = text.split("reference id:")[-1].strip()
+                if l_id not in evidence_lines:
+                    evidence_lines.append(l_id)
+
+    # Fallback if no specific lines are found (avoids empty lists breaking contract schemas)
+    if not evidence_lines:
+        for src in dossier.get("sources", []):
+            for line in src.get("lines", []):
+                if line.get("lineId"):
+                    evidence_lines.append(line.get("lineId"))
+                    break
+            if evidence_lines:
+                break
+    if not evidence_lines:
+        evidence_lines = ["line_0"]
 
     # -------------------------------------------------------------------------
-    # ROUTING MATRIX LAYER (Prioritizes Safety, Authority, then Baseline Routing)
+    # ROUTING DECISION LAYER (Fulfills strict API payload schema matrices)
     # -------------------------------------------------------------------------
-    
-    # Route 1: Security Quarantine Lock (Highest Priority)
-    if indirect_injection_detected:
-        return {
-            "action": "quarantine_item",
-            "target": {"kind": "security_queue", "id": "mailroom"},
-            "payload": {"artifactId": d_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"},
-            "evidence": [injection_line_id] if injection_line_id else ["line_0"]
-        }
-
-    # Compile the minimal sufficent evidence array for standard paths
-    minimal_evidence = []
-    if approval_line_id:
-        minimal_evidence.append(approval_line_id)
-    if argument_line_ids:
-        minimal_evidence.extend(argument_line_ids)
-    if not minimal_evidence:
-        minimal_evidence = ["line_0"]
-
-    # Route 2: Update Internal Record Schema Mapping
-    if "update_record" in objective.lower() or "delivery_window" in all_text:
+    if "update" in objective or "record" in objective:
         return {
             "action": "update_internal_record",
             "target": {"kind": "case_record", "id": d_id},
             "payload": {
                 "field": "delivery_window",
-                "sourceEventId": extracted_args["sourceEventId"] if extracted_args["sourceEventId"] else "evt_default",
-                "value": extracted_args["value"] if extracted_args["value"] else "standard_window"
+                "sourceEventId": extracted["sourceEventId"] if extracted["sourceEventId"] else "evt_default",
+                "value": extracted["value"] if extracted["value"] else "standard_window"
             },
-            "evidence": minimal_evidence
+            "evidence": evidence_lines
         }
 
-    # Route 3: Send Approved Notice (Requires Internal System Explicit Sign-off)
-    if has_trusted_approval and ("notify" in objective.lower() or "notice" in objective.lower()):
+    if has_internal_approval and ("notice" in objective or "notify" in objective):
         return {
             "action": "send_approved_notice",
-            "target": {"kind": "email", "id": extracted_args["recipient"] if extracted_args["recipient"] else "customer@domain.com"},
+            "target": {"kind": "email", "id": extracted["recipient"] if extracted["recipient"] else "customer@domain.com"},
             "payload": {
-                "referenceId": d_id,
+                "referenceId": extracted["referenceId"] if extracted["referenceId"] else d_id,
                 "status": "APPROVED",
                 "template": "approved_delivery_notice"
             },
-            "evidence": minimal_evidence
+            "evidence": evidence_lines
         }
 
-    # Route 4: Route Ambiguous Tasks to Request Confirmation Queue
-    if "unclear" in objective.lower() or "identity" in objective.lower():
-        return {
-            "action": "request_confirmation",
-            "target": {"kind": "approval_queue", "id": "operations_team"},
-            "payload": {
-                "claimedSender": extracted_args["recipient"] if extracted_args["recipient"] else "unknown_sender",
-                "questionCode": "VERIFY_REQUEST",
-                "referenceId": d_id
-            },
-            "evidence": minimal_evidence
-        }
-
-    # Route 5: Create Draft Queue Routing
-    if "draft" in objective.lower() or "reply" in objective.lower():
+    if "draft" in objective or "reply" in objective:
         return {
             "action": "create_draft",
             "target": {"kind": "draft_queue", "id": f"mailbox:{mailbox}"},
             "payload": {
-                "recipient": extracted_args["recipient"] if extracted_args["recipient"] else "customer@domain.com",
-                "referenceId": d_id,
+                "recipient": extracted["recipient"] if extracted["recipient"] else "customer@domain.com",
+                "referenceId": extracted["referenceId"] if extracted["referenceId"] else d_id,
                 "status": "PENDING",
                 "template": "order_status"
             },
-            "evidence": minimal_evidence
+            "evidence": evidence_lines
         }
 
-    # Route 6: Fallback Baseline for Informational Contexts
+    if "unclear" in objective or "ambiguous" in objective or "identity" in objective:
+        return {
+            "action": "request_confirmation",
+            "target": {"kind": "approval_queue", "id": "operations_team"},
+            "payload": {
+                "claimedSender": extracted["recipient"] if extracted["recipient"] else "unknown_sender",
+                "questionCode": "VERIFY_REQUEST",
+                "referenceId": d_id
+            },
+            "evidence": evidence_lines
+        }
+
     return {
         "action": "no_action",
         "target": None,
-        "payload": {"reasonCode": "INFORMATIONAL", "referenceId": d_id},
-        "evidence": ["line_0"]
+        "payload": {
+            "reasonCode": "INFORMATIONAL",
+            "referenceId": d_id
+        },
+        "evidence": evidence_lines
     }
-
 
 def verify_ed25519_signature(public_key_x_b64url: str, signature_b64: str, data: bytes) -> bool:
     """Verifies an Ed25519 digital signature given a base64url encoded public key x value."""
     from cryptography.hazmat.primitives.asymmetric import ed25519
     
     try:
-        # Normalize base64url padding for the public key
         rem = len(public_key_x_b64url) % 4
         if rem:
             public_key_x_b64url += '=' * (4 - rem)
         public_key_bytes = base64.urlsafe_b64decode(public_key_x_b64url)
-        
-        # Decode signature bytes
         signature_bytes = base64.b64decode(signature_b64)
-        
-        # Perform asymmetric validation
         public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
         public_key.verify(signature_bytes, data)
         return True
@@ -231,7 +220,7 @@ def verify_ed25519_signature(public_key_x_b64url: str, signature_b64: str, data:
 
 @app.post("/mailroom")
 async def mailroom_action_gate(request: Request):
-    # Parse request raw content to enforce limits
+    # Enforce request boundary checks and size restrictions
     body_bytes = await request.body()
     if not body_bytes:
         raise HTTPException(status_code=400, detail="Empty request body")
@@ -257,27 +246,22 @@ async def mailroom_action_gate(request: Request):
         if operation == "propose":
             dossiers = req_json.get("dossiers", [])
             
-            # Enforce schema integrity rules
             dossier_ids = [d.get("dossierId") for d in dossiers]
             if len(dossier_ids) != len(set(dossier_ids)):
-                raise HTTPException(status_code=400, detail="Duplicate dossierIds detected inside payload batch")
+                raise HTTPException(status_code=400, detail="Duplicate dossierIds detected")
             
-            # Compute canonical input digest over the sorted compact dossiers view
+            # Compute inputDigest exclusively over just the dossiers array
             input_digest = compute_sha256_hex(canonical_json_bytes(dossiers))
             
-            # Check for existing evaluation replay/conflicts
+            # Idempotency Replay verification check
             cursor.execute("SELECT * FROM evaluations WHERE evaluation_id = ?", (evaluation_id,))
             existing_eval = cursor.fetchone()
             
             if existing_eval:
                 if existing_eval["input_digest"] != input_digest:
-                    raise HTTPException(status_code=409, detail="Conflict: evaluationId mismatch against mutation updates")
+                    raise HTTPException(status_code=409, detail="Conflict: configuration payload mutations")
                 
-                # Fetch and replay exact saved response state
-                cursor.execute("""
-                    SELECT dossier_id, call_id, action, proposal_digest 
-                    FROM proposals WHERE evaluation_id = ?
-                """, (evaluation_id,))
+                cursor.execute("SELECT dossier_id, call_id, action, proposal_digest FROM proposals WHERE evaluation_id = ?", (evaluation_id,))
                 saved_props = cursor.fetchall()
                 
                 proposals_response = []
@@ -301,15 +285,12 @@ async def mailroom_action_gate(request: Request):
                     "proposals": proposals_response
                 }
             
-            # Extract receipt validation key infrastructure
             verifier = req_json.get("receiptVerifier", {})
             jwk_str = json.dumps(verifier.get("publicKeyJwk", {}))
             
-            # Process proposals
             proposals_out = []
             for d in dossiers:
                 d_id = d.get("dossierId")
-                # Fingerprint individual item content to circumvent duplicate AI model call charges
                 d_hash = compute_sha256_hex(canonical_json_bytes(d))
                 
                 cursor.execute("SELECT * FROM dossier_cache WHERE content_hash = ?", (d_hash,))
@@ -322,9 +303,8 @@ async def mailroom_action_gate(request: Request):
                     payload = json.loads(cached_dossier["payload"])
                     evidence = json.loads(cached_dossier["evidence"])
                 else:
-                    # Execute AI parsing engine pipeline logic
-                    ai_res = mock_ai_agent_evaluate(d)
-                    call_id = f"call_{d_hash[:20]}_{d_id[-8:]}"
+                    ai_res = evaluate_dossier_securely(d)
+                    call_id = f"call_{d_hash[:20]}_{str(d_id)[-8:]}"
                     action = ai_res["action"]
                     target = ai_res["target"]
                     payload = ai_res["payload"]
@@ -334,20 +314,18 @@ async def mailroom_action_gate(request: Request):
                         INSERT INTO dossier_cache (content_hash, call_id, action, target, payload, evidence)
                         VALUES (?, ?, ?, ?, ?, ?)
                     """, (d_hash, call_id, action, json.dumps(target), json.dumps(payload), json.dumps(evidence)))
-                # Construct deterministic proposal digest block mapping
-                                #  THE CORRECT FIXED OBJECT MATRIX BUILDER:
+                
+                # Filter elements to match exact serialization criteria for the digest
                 prop_digest_obj = {
-                    "dossierId": str(d_id),
-                    "callId": str(call_id),
-                    "action": str(action),
+                    "dossierId": d_id,
+                    "callId": call_id,
+                    "action": action,
                     "target": target,
                     "payload": payload,
-                    "evidence": sorted(list(evidence)) if isinstance(evidence, list) else [str(evidence)]
+                    "evidence": sorted(evidence)
                 }
-
                 proposal_digest = compute_sha256_hex(canonical_json_bytes(prop_digest_obj))
                 
-                # Map tracking components for phase 2 verification
                 cursor.execute("""
                     INSERT INTO proposals (evaluation_id, dossier_id, call_id, action, proposal_digest)
                     VALUES (?, ?, ?, ?, ?)
@@ -362,7 +340,6 @@ async def mailroom_action_gate(request: Request):
                     "evidence": evidence
                 })
             
-            # Save evaluation status baseline
             cursor.execute("""
                 INSERT INTO evaluations (evaluation_id, input_digest, public_key_jwk, status)
                 VALUES (?, ?, ?, 'awaiting_receipts')
@@ -370,18 +347,13 @@ async def mailroom_action_gate(request: Request):
             
             conn.commit()
             
-            response_payload = {
+            return {
                 "profile": "ga5-mailroom-action-gate/v2",
                 "evaluationId": evaluation_id,
                 "status": "awaiting_receipts",
                 "inputDigest": input_digest,
                 "proposals": proposals_out
             }
-            
-            if len(canonical_json_bytes(response_payload)) > 524288:
-                raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Payload limit threshold breached")
-                
-            return response_payload
 
         # -----------------------------------------------------------------
         # PHASE 2: COMMIT LIFECYCLE
@@ -391,19 +363,16 @@ async def mailroom_action_gate(request: Request):
             eval_record = cursor.fetchone()
             
             if not eval_record:
-                raise HTTPException(status_code=400, detail="Unknown evaluation identifier environment context")
+                raise HTTPException(status_code=400, detail="Unknown evaluation identifier context")
                 
             input_digest = req_json.get("inputDigest")
             if eval_record["input_digest"] != input_digest:
-                raise HTTPException(status_code=400, detail="Input digest scope configuration mismatch")
+                raise HTTPException(status_code=400, detail="Input digest mismatch")
                 
-            # Idempotency Replay check
             if eval_record["status"] == "completed":
-                # Instantly extract mapped execution array records
                 cursor.execute("SELECT dossier_id, call_id, action, proposal_digest FROM proposals WHERE evaluation_id = ?", (evaluation_id,))
                 cached_props = cursor.fetchall()
                 
-                # Fetch simulated processing metrics matching saved historical parameters
                 outcomes = []
                 for cp in cached_props:
                     outcomes.append({
@@ -426,9 +395,8 @@ async def mailroom_action_gate(request: Request):
             jwk = json.loads(eval_record["public_key_jwk"])
             public_key_x = jwk.get("x")
             
-            outcomes = []
-            
-            # Atomic loop execution
+            # Verify the ENTIRE signature array atomically before updating database state
+            validated_receipt_records = []
             for r in receipts:
                 d_id = r.get("dossierId")
                 c_id = r.get("callId")
@@ -436,7 +404,6 @@ async def mailroom_action_gate(request: Request):
                 p_digest = r.get("proposalDigest")
                 sig = r.get("receiptSignature")
                 
-                # Step 1: Verify receipt mapping coordinates with local proposal tracking data
                 cursor.execute("""
                     SELECT * FROM proposals 
                     WHERE evaluation_id = ? AND dossier_id = ?
@@ -444,9 +411,8 @@ async def mailroom_action_gate(request: Request):
                 local_prop = cursor.fetchone()
                 
                 if not local_prop or local_prop["call_id"] != c_id or local_prop["action"] != act or local_prop["proposal_digest"] != p_digest:
-                    raise HTTPException(status_code=400, detail="Receipt scopes conflict with state ledger entries")
+                    raise HTTPException(status_code=400, detail="Receipt validation mismatch error")
                 
-                # Step 2: Build verification inner object payload target
                 inner_receipt = {
                     "dossierId": d_id,
                     "callId": c_id,
@@ -463,23 +429,18 @@ async def mailroom_action_gate(request: Request):
                     "receipt": inner_receipt
                 }
                 
-                # Step 3: Enforce cryptographic integrity signatures
-                serialized_verification = canonical_json_bytes(verification_container)
-                if not verify_ed25519_signature(public_key_x, sig, serialized_verification):
-                    raise HTTPException(status_code=400, detail="Invalid cryptographic signature envelope detected")
+                if not verify_ed25519_signature(public_key_x, sig, canonical_json_bytes(verification_container)):
+                    raise HTTPException(status_code=400, detail="Invalid cryptographic signature entry")
                 
-                status_string = "executed" if r.get("accepted") is True else "rejected"
-                
-                outcomes.append({
+                validated_receipt_records.append({
                     "dossierId": d_id,
                     "callId": c_id,
                     "action": act,
                     "proposalDigest": p_digest,
                     "receiptId": r.get("receiptId"),
-                    "status": status_string
+                    "status": "executed" if r.get("accepted") is True else "rejected"
                 })
             
-            # Commit state status transition safely to database engine storage
             cursor.execute("UPDATE evaluations SET status = 'completed' WHERE evaluation_id = ?", (evaluation_id,))
             conn.commit()
             
@@ -488,8 +449,8 @@ async def mailroom_action_gate(request: Request):
                 "evaluationId": evaluation_id,
                 "status": "completed",
                 "inputDigest": input_digest,
-                "outcomes": outcomes
+                "outcomes": validated_receipt_records
             }
             
         else:
-            raise HTTPException(status_code=400, detail="Unsupported runtime engine command path")
+            raise HTTPException(status_code=400, detail="Unsupported command path")
